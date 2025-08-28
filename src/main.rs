@@ -1,3 +1,6 @@
+use std::fmt;
+
+use futures::TryStreamExt as _;
 use mongodb::{
     bson::{self, doc}, error::{WriteError, WriteFailure}, options::{ClientOptions, IndexOptions, ServerApi, ServerApiVersion}, Client, Collection, IndexModel
 };
@@ -37,14 +40,27 @@ enum CliCommand {
         birth: String,
         alarm_time: String,
     },
+    Query {
+        from_date: String,
+        to_date: String,
+        #[clap(short,long,help = "Optional Regexp pattern to match resident names")]
+        name: Option<String>,
+        #[clap(short,long,help = "Optional Regexp pattern to match resident locations")]
+        location: Option<String>,
+    },
     SimpleTest,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Alarm {
     time: bson::DateTime,
-    /// if None alarm is still active
-    duration_sec: Option<u64>,
+    duration_sec: u64,
+    message: String,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ActiveAlarm {
+    time: bson::DateTime,
     message: String,
 }
 
@@ -55,6 +71,7 @@ struct Resident {
     location: String,
     resident_since: bson::DateTime,
     alarms: Vec<Alarm>,
+    active_alarms: Vec<ActiveAlarm>,
 }
 
 impl Resident {
@@ -65,6 +82,7 @@ impl Resident {
             location: location.to_string(),
             resident_since: bson::DateTime::parse_rfc3339_str(resident_since.to_string() + "T00:00:00Z")?,
             alarms: Vec::new(),
+            active_alarms: Vec::new(),
         })
     }
 
@@ -85,6 +103,30 @@ impl Resident {
     }
 }
 
+impl fmt::Display for Resident {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Resident {{ name: {}, birth: {}, location: {}, resident_since: {} }}",
+            self.name,
+            self.birth,
+            self.location,
+            self.resident_since,
+        )?;
+        for active_alarm in &self.active_alarms {
+            write!(f, "\n  ActiveAlarm {{ time: {}, message: {} }}",
+                active_alarm.time,
+                active_alarm.message,
+            )?;
+        }
+        for alarm in &self.alarms {
+            write!(f, "\n  HistoryAlarm {{ time: {}, duration_sec: {}, message: {} }}",
+                alarm.time,
+                alarm.duration_sec,
+                alarm.message,
+            )?;
+        }
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -136,8 +178,55 @@ async fn main() -> Result<()> {
         CliCommand::ClearAlarm { name, birth, alarm_time } => {
             test_clear_alarm(&collection, name, birth, alarm_time).await?;
         }
+        CliCommand::Query { from_date, to_date, name, location } => {
+            test_query(&collection, from_date, to_date, name.as_deref(), location.as_deref()).await?;
+        }
     }
 
+    Ok(())
+}
+
+#[tracing::instrument(name = "query", skip(collection), level = Level::TRACE)]
+async fn test_query(collection: &Collection<Resident>, from_date: &str, to_date: &str, name: Option<&str>, location: Option<&str>) -> Result<()> {
+    let mut filter = if let Some(name_pattern) = name && let Some(location_pattern) = location {
+        doc! {
+            "$or": [
+                { "name": { "$regex": name_pattern, "$options": "i" } },
+                { "location": { "$regex": location_pattern, "$options": "i" } }
+            ]
+        }
+    } else if let Some(name_pattern) = name {
+        doc! { "name": { "$regex": name_pattern, "$options": "i" } }
+    } else if let Some(location_pattern) = location {
+        doc! { "location": { "$regex": location_pattern, "$options": "i" } }
+    } else {
+        doc! {}
+    };
+    filter.extend(doc! {
+        "alarms.time": {
+            "$gte": bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")?,
+            "$lte": bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")?
+        }
+    });
+    let pipeline = vec![
+        doc! { "$match": filter },
+        doc! { "$project": { 
+            "name": 1, "location": 1, 
+            "alarms_count": { "$size": "$alarms" }, 
+            "alarms_avg_duration": { "$avg": "$alarms.duration_sec" },
+            "active_alarms_count": { "$size": { "$ifNull": ["$active_alarms", []] } }
+        } }
+    ];
+    match collection.aggregate(pipeline).await {
+        Ok(mut cursor) => {
+            while let Some(resident) = cursor.try_next().await? {
+                println!("{}", resident);
+            }
+        }
+        Err(e) => {
+            error!("Failed to query residents: {}", e);
+        }
+    }
     Ok(())
 }
 
@@ -148,13 +237,12 @@ async fn test_new_alarm(collection: &Collection<Resident>, name: &str, birth: &s
         "name": name,
         "birth": birth_date,
     };
-    let new_alarm = Alarm {
+    let new_alarm = ActiveAlarm {
         time: bson::DateTime::now(),
-        duration_sec: None,
         message: message.to_string(),
     };
     let update = doc! {
-        "$push": { "alarms": bson::to_bson(&new_alarm)? }
+        "$push": { "active_alarms": bson::to_bson(&new_alarm)? }
     };
     match collection.update_one(filter, update).await {
         Ok(update_result) => {
@@ -177,24 +265,131 @@ async fn test_clear_alarm(collection: &Collection<Resident>, name: &str, birth: 
     let filter = doc! {
         "name": name,
         "birth": birth_date,
-        "alarms.time" : start_time,
     };
-    let duration = bson::DateTime::now().checked_duration_since(start_time).unwrap_or_default().as_secs();
-    let update = doc! {
-        "$set": { "alarms.$.duration_sec": bson::to_bson(&duration)? }
-    };
-    match collection.update_one(filter, update).await {
-        Ok(update_result) => {
-            if update_result.matched_count > 0 {
-                info!("Alarm cleared for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
-            } else {
-                warn!("No resident found to clear alarm.");
+    let mut resident_id_and_alarm = collection.aggregate(vec![
+        doc! { "$match": filter },
+        doc! { "$project": { "id": "$_id", "alarm": { "$filter": { "input": "$active_alarms", "as": "alarm", "cond": { "$eq": [ "$$alarm.time", start_time ] } } } } } 
+    ]).await?;
+    if let Some(resident) = resident_id_and_alarm.try_next().await? {
+        let resident_id = resident.get("_id");
+
+        let alarm_array = resident.get_array("alarm")?;
+        if alarm_array.is_empty() {
+            warn!("No active alarm found with the specified time to clear.");
+            return Ok(());
+        }
+        let alarm_doc = alarm_array[0].as_document().unwrap();
+        let message = alarm_doc.get_str("message").unwrap_or("");
+        let alarm_time = alarm_doc.get_datetime("time").unwrap();
+        let duration = bson::DateTime::now().checked_duration_since(*alarm_time).unwrap_or_default().as_secs();
+        info!("Clearing alarm for resident id: {:?}, message: {}, start_time: {}, duration_sec: {}", resident_id, message, alarm_time.try_to_rfc3339_string()?, duration);
+
+        // remove alarm from active
+        let filter = doc! {
+            "_id": resident_id
+        };
+        let update = doc! {
+            "$pull": {
+                "active_alarms": {
+                    "time": alarm_time
+                }
             }
-        }
-        Err(e) => {
-            error!("Failed to clear alarm: {}", e);
-        }
+        };
+        match collection.update_one(filter.clone(), update).await {
+            Ok(update_result) => {
+                if update_result.matched_count > 0 {
+                    info!("Alarm cleared from active for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
+                } else {
+                    warn!("No resident found to clear alarm.");
+                }
+            }
+            Err(e) => {
+                error!("Failed to clear alarm: {}", e);
+            }
+        };
+
+        // add alarm to history
+        let history_update = doc! {
+            "$push": {
+                "alarms": {
+                    "time": alarm_time,
+                    "message": message,
+                    "duration_sec": bson::to_bson(&duration)?
+                }
+            }
+        };
+        match collection.update_one(filter, history_update).await {
+            Ok(update_result) => {
+                if update_result.matched_count > 0 {
+                    info!("Alarm added to history for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
+                } else {
+                    warn!("No resident found to add alarm to history.");
+                }
+            }
+            Err(e) => {
+                error!("Failed to add alarm to history: {}", e);
+            }
+        };
+    } else {
+        warn!("No resident found to clear alarm.");
+        return Ok(());
     }
+
+    // let duration = bson::DateTime::now().checked_duration_since(start_time).unwrap_or_default().as_secs();
+    // let update = doc! {
+    //     "$set": {
+    //         "active_alarms.duration_sec": bson::to_bson(&duration)?
+    //     }
+    // };
+    // let mut set_filter = filter.clone();
+    // set_filter.extend(doc! { "active_alarms.time": start_time });
+    // match collection.update_one(set_filter, update).await {
+    //     Ok(update_result) => {
+    //         if update_result.matched_count > 0 {
+    //             info!("Alarm cleared updated for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
+    //         } else {
+    //             warn!("No resident found to clear alarm.");
+    //         }
+    //     }
+    //     Err(e) => {
+    //         error!("Failed to clear alarm: {}", e);
+    //     }
+    // }
+    // let update = doc! {
+    //     "$set": { 
+    //         "active_alarms" : {
+    //             "$filter": {
+    //                 "input": "$active_alarms",
+    //                 "as": "alarm",
+    //                 "cond": { "$ne": [ "$$alarm.time", start_time ] }
+    //             }
+    //         },
+    //         "alarms" : {
+    //             "$concatArrays": [
+    //                 "$alarms",
+    //                 { 
+    //                     "$filter": {
+    //                         "input": "$active_alarms",
+    //                         "as": "alarm",
+    //                         "cond": { "$eq": [ "$$alarm.time", start_time ] }
+    //                     }
+    //                 }
+    //             ]
+    //         }
+    //     }
+    // };
+    // match collection.update_one(filter, update).await {
+    //     Ok(update_result) => {
+    //         if update_result.matched_count > 0 {
+    //             info!("Alarm cleared moved to history for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
+    //         } else {
+    //             warn!("No resident found to clear alarm.");
+    //         }
+    //     }
+    //     Err(e) => {
+    //         error!("Failed to clear alarm: {}", e);
+    //     }
+    // }
     Ok(())
 }
 
