@@ -24,6 +24,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
+    NewAlarmCsv {
+        file_path: String,
+        count: usize,
+    },
     InsertCsv {
         file_path: String,
     },
@@ -78,10 +82,10 @@ struct ActiveAlarm {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Resident {
     name: String,
-    #[serde(with = "serde_helpers::bson_datetime_as_rfc3339_string_date")]
+    #[serde(deserialize_with = "serde_helpers::bson_datetime_as_rfc3339_string_date::deserialize")]
     birth: bson::DateTime,
     location: String,
-    #[serde(with = "serde_helpers::bson_datetime_as_rfc3339_string_date")]
+    #[serde(deserialize_with = "serde_helpers::bson_datetime_as_rfc3339_string_date::deserialize")]
     resident_since: bson::DateTime,
     #[serde(default)]
     alarms: Vec<Alarm>,
@@ -147,7 +151,7 @@ impl fmt::Display for Resident {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     tracing_subscriber::fmt::init();
     dotenv::dotenv().ok();
     let mongodb_uri = dotenv::var("MONGODB_URI").expect("MONGODB_URI must be set in .env");
@@ -173,7 +177,7 @@ async fn main() -> Result<()> {
         .build();
     collection.create_index(unique_index).await?;
 
-    match &cli.command {
+    match &mut cli.command {
         CliCommand::Insert {
             name,
             birth,
@@ -225,6 +229,26 @@ async fn main() -> Result<()> {
         CliCommand::InsertCsv { file_path } => {
             test_insert_csv(&collection, file_path, cli.upsert).await?;
         }
+        CliCommand::NewAlarmCsv { file_path, count } => {
+            let mut reader = ReaderBuilder::new()
+                .has_headers(true)
+                .from_path(file_path)?;
+            while *count > 0
+                && let Some(Ok(record)) = reader.deserialize::<Resident>().next()
+            {
+                if rand::random::<f32>() > (0.02 + *count as f32 * 0.02) {
+                    continue;
+                }
+                test_new_alarm(
+                    &collection,
+                    &record.name,
+                    &record.birth.try_to_rfc3339_string()?[..10],
+                    "test csv alarm",
+                )
+                .await?;
+                *count -= 1;
+            }
+        }
     }
 
     Ok(())
@@ -275,10 +299,13 @@ async fn test_query(
         doc! {}
     };
     filter.extend(doc! {
-        "alarms.time": {
-            "$gte": bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")?,
-            "$lte": bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")?
-        }
+        "$or": [
+            { "active_alarms.0": { "$exists": true } },
+            { "alarms.time": {
+                "$gte": bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")?,
+                "$lte": bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")?
+            }}
+        ]
     });
     let pipeline = vec![
         doc! { "$match": filter },
@@ -329,6 +356,12 @@ async fn test_new_alarm(
                     new_alarm.time.try_to_rfc3339_string()?,
                     update_result.matched_count,
                     update_result.modified_count
+                );
+                println!(
+                    "To clear: mongodb-test clear-alarm '{}' '{}' '{}'",
+                    name,
+                    birth,
+                    new_alarm.time.try_to_rfc3339_string()?
                 );
             } else {
                 warn!("No resident found to add alarm.");
@@ -627,6 +660,7 @@ mod serde_helpers {
             Ok(date)
         }
 
+        #[allow(unused)]
         /// Serializes a [`bson::DateTime`] as an RFC 3339 (ISO 8601) formatted string.
         pub fn serialize<S: Serializer>(
             val: &bson::DateTime,
