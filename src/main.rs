@@ -349,6 +349,8 @@ async fn test_query(
             "name": 1, "location": 1,
             "alarms_count": { "$size": { "$ifNull": ["$filteredAlarms", []] } },
             "alarms_avg_duration": { "$avg": "$filteredAlarms.duration_sec" },
+            "alarms_min_time": { "$min": "$filteredAlarms.time" },
+            "alarms_max_time": { "$max": "$filteredAlarms.time" },
             "active_alarms_count": { "$size": { "$ifNull": ["$active_alarms", []] } }
         } },
         doc! { "$sort": { "location": 1 } },

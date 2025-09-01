@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::Local;
 use futures::TryStreamExt as _;
 use mongodb::bson;
 
@@ -98,11 +99,36 @@ pub async fn bson_to_csv(
             first = false;
         }
         // Write the values row (values of the BSON document)
-        let values: Vec<String> = doc.values().map(|v| v.to_string()).collect();
+        let values: Vec<String> = doc.values().map(bson_value_to_str).collect();
         writer.write_record(&values)?;
     }
 
     // Flush and close the writer
     writer.flush()?;
     Ok(())
+}
+
+fn bson_value_to_str(value: &bson::Bson) -> String {
+    match value {
+        bson::Bson::String(s) => s.clone(),
+        bson::Bson::Boolean(b) => {
+            if *b {
+                "yes".into()
+            } else {
+                "no".into()
+            }
+        }
+        bson::Bson::DateTime(dt) => bson_to_chrono(dt)
+            .map(|cdt| {
+                cdt.with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "Invalid Date".into()),
+        _ => value.to_string(),
+    }
+}
+
+fn bson_to_chrono(dt: &bson::DateTime) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_millis(dt.timestamp_millis())
 }
