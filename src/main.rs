@@ -11,6 +11,7 @@ use mongodb::{
     options::{ClientOptions, IndexOptions, ServerApi, ServerApiVersion},
 };
 use tracing::{Level, error, info, warn};
+use utils::{DateTimeStr, serde_helpers};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -27,6 +28,8 @@ enum CliCommand {
     NewAlarmCsv {
         file_path: String,
         count: usize,
+        #[clap(long)]
+        no_clear: bool,
     },
     InsertCsv {
         file_path: String,
@@ -62,6 +65,8 @@ enum CliCommand {
             help = "Optional Regexp pattern to match resident locations"
         )]
         location: Option<String>,
+        #[clap(long, help = "CSV File to Save Results")]
+        csv: Option<String>,
     },
     SimpleTest,
 }
@@ -97,11 +102,9 @@ impl Resident {
     fn new(name: &str, birth: &str, location: &str, resident_since: &str) -> Result<Self> {
         Ok(Resident {
             name: name.to_string(),
-            birth: bson::DateTime::parse_rfc3339_str(birth.to_string() + "T00:00:00Z")?,
+            birth: DateTimeStr::Str(birth).into(),
             location: location.to_string(),
-            resident_since: bson::DateTime::parse_rfc3339_str(
-                resident_since.to_string() + "T00:00:00Z",
-            )?,
+            resident_since: DateTimeStr::Str(resident_since).into(),
             alarms: Vec::new(),
             active_alarms: Vec::new(),
         })
@@ -148,6 +151,8 @@ impl fmt::Display for Resident {
         Ok(())
     }
 }
+
+mod utils;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -209,13 +214,14 @@ async fn main() -> Result<()> {
             birth,
             alarm_time,
         } => {
-            test_clear_alarm(&collection, name, birth, alarm_time).await?;
+            test_clear_alarm(&collection, name, birth, DateTimeStr::Str(alarm_time), None).await?;
         }
         CliCommand::Query {
             from_date,
             to_date,
             name,
             location,
+            csv,
         } => {
             test_query(
                 &collection,
@@ -223,30 +229,48 @@ async fn main() -> Result<()> {
                 to_date,
                 name.as_deref(),
                 location.as_deref(),
+                csv.as_deref(),
             )
             .await?;
         }
         CliCommand::InsertCsv { file_path } => {
             test_insert_csv(&collection, file_path, cli.upsert).await?;
         }
-        CliCommand::NewAlarmCsv { file_path, count } => {
+        CliCommand::NewAlarmCsv {
+            file_path,
+            count,
+            no_clear,
+        } => {
             let mut reader = ReaderBuilder::new()
                 .has_headers(true)
                 .from_path(file_path)?;
+            let mut alarms = Vec::new();
             while *count > 0
                 && let Some(Ok(record)) = reader.deserialize::<Resident>().next()
             {
                 if rand::random::<f32>() > (0.02 + *count as f32 * 0.02) {
                     continue;
                 }
-                test_new_alarm(
-                    &collection,
-                    &record.name,
-                    &record.birth.try_to_rfc3339_string()?[..10],
-                    "test csv alarm",
-                )
-                .await?;
+                let name = record.name.clone();
+                let birth = record.birth.try_to_rfc3339_string()?[..10].to_string();
+                alarms.push((
+                    name,
+                    birth.clone(),
+                    test_new_alarm(&collection, &record.name, &birth, "test csv alarm").await?,
+                ));
                 *count -= 1;
+            }
+            if !*no_clear {
+                for (name, birth, alarm_time) in alarms {
+                    test_clear_alarm(
+                        &collection,
+                        &name,
+                        &birth,
+                        DateTimeStr::DateTime(alarm_time),
+                        Some(rand::random::<u64>() % 600),
+                    )
+                    .await?;
+                }
             }
         }
     }
@@ -281,6 +305,7 @@ async fn test_query(
     to_date: &str,
     name: Option<&str>,
     location: Option<&str>,
+    csv: Option<&str>,
 ) -> Result<()> {
     let mut filter = if let Some(name_pattern) = name
         && let Some(location_pattern) = location
@@ -301,25 +326,41 @@ async fn test_query(
     filter.extend(doc! {
         "$or": [
             { "active_alarms.0": { "$exists": true } },
-            { "alarms.time": {
-                "$gte": bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")?,
-                "$lte": bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")?
-            }}
+            { "$expr": { "$gt": [ { "$size": "$filteredAlarms" }, 0 ] } }
         ]
     });
     let pipeline = vec![
+        doc! { "$addFields": {
+            "filteredAlarms": {
+                "$filter": {
+                    "input": "$alarms",
+                    "as": "alarm",
+                    "cond": {
+                        "$and": [
+                            { "$gte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")? ] },
+                            { "$lte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")? ] }
+                        ]
+                    }
+                }
+            }
+        } },
         doc! { "$match": filter },
         doc! { "$project": {
             "name": 1, "location": 1,
-            "alarms_count": { "$size": "$alarms" },
-            "alarms_avg_duration": { "$avg": "$alarms.duration_sec" },
+            "alarms_count": { "$size": { "$ifNull": ["$filteredAlarms", []] } },
+            "alarms_avg_duration": { "$avg": "$filteredAlarms.duration_sec" },
             "active_alarms_count": { "$size": { "$ifNull": ["$active_alarms", []] } }
         } },
+        doc! { "$sort": { "location": 1 } },
     ];
     match collection.aggregate(pipeline).await {
         Ok(mut cursor) => {
-            while let Some(resident) = cursor.try_next().await? {
-                println!("{}", resident);
+            if let Some(csv) = csv {
+                utils::bson_to_csv(cursor, csv).await?;
+            } else {
+                while let Some(resident) = cursor.try_next().await? {
+                    println!("{}", resident);
+                }
             }
         }
         Err(e) => {
@@ -335,8 +376,8 @@ async fn test_new_alarm(
     name: &str,
     birth: &str,
     message: &str,
-) -> Result<()> {
-    let birth_date = bson::DateTime::parse_rfc3339_str(birth.to_string() + "T00:00:00Z")?;
+) -> Result<bson::DateTime> {
+    let birth_date: bson::DateTime = DateTimeStr::Str(birth).into();
     let filter = doc! {
         "name": name,
         "birth": birth_date,
@@ -363,25 +404,26 @@ async fn test_new_alarm(
                     birth,
                     new_alarm.time.try_to_rfc3339_string()?
                 );
+                Ok(new_alarm.time)
             } else {
-                warn!("No resident found to add alarm.");
+                anyhow::bail!("No resident found to add alarm.");
             }
         }
         Err(e) => {
-            error!("Failed to add alarm: {}", e);
+            anyhow::bail!(format!("Failed to add alarm: {}", e));
         }
     }
-    Ok(())
 }
-#[tracing::instrument(name = "clear_alarm", skip_all, fields(name=%name, birth=%birth), level = Level::TRACE)]
+#[tracing::instrument(name = "clear_alarm", skip_all, fields(name=%name, birth=%birth, alarm=%alarm_time), level = Level::TRACE)]
 async fn test_clear_alarm(
     collection: &Collection<Resident>,
     name: &str,
     birth: &str,
-    alarm_time: &str,
+    alarm_time: DateTimeStr<'_>,
+    duration: Option<u64>,
 ) -> Result<()> {
-    let birth_date = bson::DateTime::parse_rfc3339_str(birth.to_string() + "T00:00:00Z")?;
-    let start_time = bson::DateTime::parse_rfc3339_str(alarm_time)?;
+    let birth_date: bson::DateTime = DateTimeStr::Str(birth).into();
+    let start_time: bson::DateTime = alarm_time.into();
     let filter = doc! {
         "name": name,
         "birth": birth_date,
@@ -401,10 +443,12 @@ async fn test_clear_alarm(
         let alarm_doc = alarm_array[0].as_document().unwrap();
         let message = alarm_doc.get_str("message").unwrap_or("");
         let alarm_time = alarm_doc.get_datetime("time").unwrap();
-        let duration = bson::DateTime::now()
-            .checked_duration_since(*alarm_time)
-            .unwrap_or_default()
-            .as_secs();
+        let duration = duration.unwrap_or(
+            bson::DateTime::now()
+                .checked_duration_since(*alarm_time)
+                .unwrap_or_default()
+                .as_secs(),
+        );
         info!(
             "Clearing alarm for resident id: {:?}, message: {}, start_time: {}, duration_sec: {}",
             resident_id,
@@ -531,7 +575,7 @@ async fn test_clear_alarm(
 // Delete a resident by name and birth date
 #[tracing::instrument(name = "delete", skip_all, fields(name=%name, birth=%birth), level = Level::TRACE)]
 async fn test_delete(collection: &Collection<Resident>, name: &str, birth: &str) -> Result<()> {
-    let birth_date = bson::DateTime::parse_rfc3339_str(birth.to_string() + "T00:00:00Z")?;
+    let birth_date: bson::DateTime = DateTimeStr::Str(birth).into();
     let filter = doc! {
         "name": name,
         "birth": birth_date,
@@ -633,43 +677,4 @@ async fn simple_test(collection: &Collection<Resident>) -> Result<()> {
     test_delete(collection, "John Doe", "1990-01-01").await?;
     test_delete(collection, "Jane Smith", "1985-05-15").await?;
     Ok(())
-}
-
-mod serde_helpers {
-    pub mod bson_datetime_as_rfc3339_string_date {
-        use mongodb::bson;
-        use serde::{Deserialize, Deserializer, Serializer, de, ser};
-        use std::result::Result;
-
-        /// Deserializes a [`bson::DateTime`] from an RFC 3339 formatted string.
-        pub fn deserialize<'de, D>(deserializer: D) -> Result<bson::DateTime, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            let mut iso = String::deserialize(deserializer)?;
-            if !iso.contains('T') {
-                // assume date only
-                iso.push_str("T00:00:00Z");
-            } else if !iso.ends_with('Z') && !iso.contains('+') && !iso.contains('-') {
-                // assume UTC if no timezone provided
-                iso.push('Z');
-            }
-            let date = bson::DateTime::parse_rfc3339_str(&iso).map_err(|_| {
-                de::Error::custom(format!("cannot parse RFC 3339 datetime from \"{}\"", iso))
-            })?;
-            Ok(date)
-        }
-
-        #[allow(unused)]
-        /// Serializes a [`bson::DateTime`] as an RFC 3339 (ISO 8601) formatted string.
-        pub fn serialize<S: Serializer>(
-            val: &bson::DateTime,
-            serializer: S,
-        ) -> Result<S::Ok, S::Error> {
-            let formatted = val.try_to_rfc3339_string().map_err(|e| {
-                ser::Error::custom(format!("cannot format {} as RFC 3339: {}", val, e))
-            })?;
-            serializer.serialize_str(&formatted)
-        }
-    }
 }
