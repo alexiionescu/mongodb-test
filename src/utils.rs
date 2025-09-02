@@ -54,13 +54,13 @@ impl std::fmt::Display for DateTimeStr<'_> {
 }
 
 pub mod serde_helpers {
-    pub mod bson_datetime_as_rfc3339_string_date {
+    pub mod bson_dateonly {
         use crate::utils::DateTimeStr;
         use mongodb::bson;
         use serde::{Deserialize, Deserializer, Serializer, ser};
         use std::result::Result;
 
-        /// Deserializes a [`bson::DateTime`] from an RFC 3339 formatted string.
+        /// Deserializes a [`bson::DateTime`] from an RFC 3339 formatted date (YYYY-MM-DD).
         pub fn deserialize<'de, D>(deserializer: D) -> Result<bson::DateTime, D::Error>
         where
             D: Deserializer<'de>,
@@ -68,16 +68,15 @@ pub mod serde_helpers {
             Ok(DateTimeStr::String(String::deserialize(deserializer)?).into())
         }
 
-        #[allow(unused)]
-        /// Serializes a [`bson::DateTime`] as an RFC 3339 (ISO 8601) formatted string.
+        /// Serializes a [`bson::DateTime`] as an RFC 3339 (ISO 8601) formatted date (YYYY-MM-DD).
         pub fn serialize<S: Serializer>(
             val: &bson::DateTime,
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
-            let formatted = val.try_to_rfc3339_string().map_err(|e| {
+            let formatted = &val.try_to_rfc3339_string().map_err(|e| {
                 ser::Error::custom(format!("cannot format {} as RFC 3339: {}", val, e))
-            })?;
-            serializer.serialize_str(&formatted)
+            })?[..10]; // only date part
+            serializer.serialize_str(formatted)
         }
     }
 }

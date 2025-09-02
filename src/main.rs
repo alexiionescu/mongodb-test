@@ -12,7 +12,7 @@ use mongodb::{
 };
 use tokio::time::Instant;
 use tracing::{Level, error, info, warn};
-use utils::{DateTimeStr, serde_helpers};
+use utils::DateTimeStr;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -84,6 +84,10 @@ enum CliCommand {
         birth: String,
         alarm_time: String,
     },
+    ForceClose {
+        name: String,
+        birth: String,
+    },
     Query(QueryParams),
     SimpleTest,
 }
@@ -104,10 +108,8 @@ struct ActiveAlarm {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct Resident {
     name: String,
-    #[serde(deserialize_with = "serde_helpers::bson_datetime_as_rfc3339_string_date::deserialize")]
     birth: bson::DateTime,
     location: String,
-    #[serde(deserialize_with = "serde_helpers::bson_datetime_as_rfc3339_string_date::deserialize")]
     resident_since: bson::DateTime,
     #[serde(default)]
     alarms: Vec<Alarm>,
@@ -169,6 +171,28 @@ impl fmt::Display for Resident {
     }
 }
 
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ResidentCsv {
+    name: String,
+    #[serde(with = "utils::serde_helpers::bson_dateonly")]
+    birth: bson::DateTime,
+    location: String,
+    #[serde(with = "utils::serde_helpers::bson_dateonly")]
+    resident_since: bson::DateTime,
+}
+
+impl From<ResidentCsv> for Resident {
+    fn from(csv: ResidentCsv) -> Self {
+        Resident {
+            name: csv.name,
+            birth: csv.birth,
+            location: csv.location,
+            resident_since: csv.resident_since,
+            alarms: Vec::new(),
+            active_alarms: Vec::new(),
+        }
+    }
+}
 mod utils;
 
 #[tokio::main]
@@ -250,7 +274,7 @@ async fn main() -> Result<()> {
                 .from_path(file_path)?;
             let mut alarms = Vec::new();
             while *count > 0
-                && let Some(Ok(record)) = reader.deserialize::<Resident>().next()
+                && let Some(Ok(record)) = reader.deserialize::<ResidentCsv>().next()
             {
                 if rand::random::<f32>() > (0.02 + *count as f32 * 0.02) {
                     continue;
@@ -277,6 +301,37 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        CliCommand::ForceClose { name, birth } => {
+            test_force_close(&collection, name, birth).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tracing::instrument(name = "force_close", skip(collection), level = Level::TRACE)]
+async fn test_force_close(
+    collection: &Collection<Resident>,
+    name: &str,
+    birth: &str,
+) -> Result<()> {
+    let birth_date: bson::DateTime = DateTimeStr::Str(birth).into();
+    let filter = doc! {
+        "name": name,
+        "birth": birth_date,
+    };
+    // get resident
+    if let Some(resident) = collection.find_one(filter).await? {
+        for alarm in resident.active_alarms {
+            test_clear_alarm(
+                collection,
+                name,
+                birth,
+                DateTimeStr::DateTime(alarm.time),
+                None,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -290,8 +345,8 @@ async fn test_insert_csv(
     let mut reader = ReaderBuilder::new()
         .has_headers(true)
         .from_path(file_path)?;
-    for result in reader.deserialize() {
-        let record: Resident = result?;
+    for result in reader.deserialize::<ResidentCsv>() {
+        let record: Resident = result?.into();
         println!("Importing {}", record);
         if upsert {
             test_upsert(collection, record).await?;
@@ -359,7 +414,7 @@ async fn test_query(
         } },
         doc! { "$match": filter },
         doc! { "$project": {
-            "name": 1, "location": 1,
+            "name": 1, "location": 1, "birth" : 1,
             "alarms_count": { "$size": { "$ifNull": ["$filteredAlarms", []] } },
             "avg_duration": { "$avg": "$filteredAlarms.duration_sec" },
             "max_duration": { "$max": "$filteredAlarms.duration_sec" },
