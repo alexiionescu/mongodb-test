@@ -167,7 +167,6 @@ fn bson_value_to_str(value: &bson::Bson, key: &str) -> String {
             .format("%Y-%m-%d %H:%M")
             .to_string(),
         bson::Bson::Double(d) => {
-            println!("Formatting BSON Double: {} for {}", d, key);
             if key.contains("duration") {
                 format_timedelta(d)
             } else {

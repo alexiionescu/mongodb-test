@@ -10,6 +10,7 @@ use mongodb::{
     error::{WriteError, WriteFailure},
     options::{ClientOptions, IndexOptions, ServerApi, ServerApiVersion},
 };
+use tokio::time::Instant;
 use tracing::{Level, error, info, warn};
 use utils::{DateTimeStr, serde_helpers};
 
@@ -23,6 +24,28 @@ struct Cli {
     upsert: bool,
 }
 
+#[derive(Parser)]
+struct QueryParams {
+    #[clap(
+        default_value_t = 10,
+        help = "Maximum number of alarms to return per resident"
+    )]
+    alarms_limit: i32,
+    #[clap(short, long, help = "From Date (YYYY-MM-DD)")]
+    from_date: Option<String>,
+    #[clap(short, long, help = "To Date (YYYY-MM-DD)")]
+    to_date: Option<String>,
+    #[clap(short, long, help = "Optional Regexp pattern to match resident names")]
+    name: Option<String>,
+    #[clap(
+        short,
+        long,
+        help = "Optional Regexp pattern to match resident locations"
+    )]
+    location: Option<String>,
+    #[clap(long, help = "CSV File to Save Results")]
+    csv: Option<String>,
+}
 #[derive(Subcommand)]
 enum CliCommand {
     NewAlarmCsv {
@@ -61,20 +84,7 @@ enum CliCommand {
         birth: String,
         alarm_time: String,
     },
-    Query {
-        from_date: String,
-        to_date: String,
-        #[clap(short, long, help = "Optional Regexp pattern to match resident names")]
-        name: Option<String>,
-        #[clap(
-            short,
-            long,
-            help = "Optional Regexp pattern to match resident locations"
-        )]
-        location: Option<String>,
-        #[clap(long, help = "CSV File to Save Results")]
-        csv: Option<String>,
-    },
+    Query(QueryParams),
     SimpleTest,
 }
 
@@ -223,22 +233,8 @@ async fn main() -> Result<()> {
         } => {
             test_clear_alarm(&collection, name, birth, DateTimeStr::Str(alarm_time), None).await?;
         }
-        CliCommand::Query {
-            from_date,
-            to_date,
-            name,
-            location,
-            csv,
-        } => {
-            test_query(
-                &collection,
-                from_date,
-                to_date,
-                name.as_deref(),
-                location.as_deref(),
-                csv.as_deref(),
-            )
-            .await?;
+        CliCommand::Query(query_params) => {
+            test_query(&collection, query_params).await?;
         }
         CliCommand::InsertCsv { file_path } => {
             test_insert_csv(&collection, file_path, cli.upsert).await?;
@@ -306,17 +302,13 @@ async fn test_insert_csv(
     Ok(())
 }
 
-#[tracing::instrument(name = "query", skip(collection), level = Level::TRACE)]
+#[tracing::instrument(name = "query", skip_all, level = Level::TRACE)]
 async fn test_query(
     collection: &Collection<Resident>,
-    from_date: &str,
-    to_date: &str,
-    name: Option<&str>,
-    location: Option<&str>,
-    csv: Option<&str>,
+    query_params: &mut QueryParams,
 ) -> Result<()> {
-    let mut filter = if let Some(name_pattern) = name
-        && let Some(location_pattern) = location
+    let mut filter = if let Some(name_pattern) = &query_params.name
+        && let Some(location_pattern) = &query_params.location
     {
         doc! {
             "$or": [
@@ -324,9 +316,9 @@ async fn test_query(
                 { "location": { "$regex": location_pattern, "$options": "i" } }
             ]
         }
-    } else if let Some(name_pattern) = name {
+    } else if let Some(name_pattern) = &query_params.name {
         doc! { "name": { "$regex": name_pattern, "$options": "i" } }
-    } else if let Some(location_pattern) = location {
+    } else if let Some(location_pattern) = &query_params.location {
         doc! { "location": { "$regex": location_pattern, "$options": "i" } }
     } else {
         doc! {}
@@ -340,16 +332,29 @@ async fn test_query(
     let pipeline = vec![
         doc! { "$addFields": {
             "filteredAlarms": {
-                "$filter": {
-                    "input": "$alarms",
-                    "as": "alarm",
-                    "cond": {
-                        "$and": [
-                            { "$gte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")? ] },
-                            { "$lte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")? ] }
-                        ]
-                    }
-                }
+                "$slice": [
+                    {
+                        "$filter": {
+                            "input": "$alarms",
+                            "as": "alarm",
+                            "cond": {
+                                "$and": [
+                                    if let Some(from_date) = &query_params.from_date {
+                                        doc! { "$gte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")? ] }
+                                    } else {
+                                        doc! { }
+                                    },
+                                    if let Some(to_date) = &query_params.to_date {
+                                        doc! { "$lte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")? ] }
+                                    } else {
+                                        doc! { }
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    -query_params.alarms_limit
+                ]
             }
         } },
         doc! { "$match": filter },
@@ -360,13 +365,17 @@ async fn test_query(
             "max_duration": { "$max": "$filteredAlarms.duration_sec" },
             "first": { "$min": "$filteredAlarms.time" },
             "last": { "$max": "$filteredAlarms.time" },
-            "active": { "$size": { "$ifNull": ["$active_alarms", []] } }
+            "active_since": { "$min": "$active_alarms.time" },
+            "active_count": { "$size": { "$ifNull": ["$active_alarms", []] } }
         } },
         doc! { "$sort": { "location": 1 } },
     ];
+    let time = Instant::now();
     match collection.aggregate(pipeline).await {
         Ok(cursor) => {
-            if let Some(csv) = csv {
+            let elapsed = time.elapsed();
+            info!("Query executed in {:?}", elapsed);
+            if let Some(csv) = &query_params.csv {
                 utils::bson_to_csv(cursor, csv).await?;
             } else {
                 utils::bson_table_print(cursor).await?;
@@ -522,62 +531,6 @@ async fn test_clear_alarm(
         warn!("No resident found to clear alarm.");
         return Ok(());
     }
-
-    // let duration = bson::DateTime::now().checked_duration_since(start_time).unwrap_or_default().as_secs();
-    // let update = doc! {
-    //     "$set": {
-    //         "active_alarms.duration_sec": bson::to_bson(&duration)?
-    //     }
-    // };
-    // let mut set_filter = filter.clone();
-    // set_filter.extend(doc! { "active_alarms.time": start_time });
-    // match collection.update_one(set_filter, update).await {
-    //     Ok(update_result) => {
-    //         if update_result.matched_count > 0 {
-    //             info!("Alarm cleared updated for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
-    //         } else {
-    //             warn!("No resident found to clear alarm.");
-    //         }
-    //     }
-    //     Err(e) => {
-    //         error!("Failed to clear alarm: {}", e);
-    //     }
-    // }
-    // let update = doc! {
-    //     "$set": {
-    //         "active_alarms" : {
-    //             "$filter": {
-    //                 "input": "$active_alarms",
-    //                 "as": "alarm",
-    //                 "cond": { "$ne": [ "$$alarm.time", start_time ] }
-    //             }
-    //         },
-    //         "alarms" : {
-    //             "$concatArrays": [
-    //                 "$alarms",
-    //                 {
-    //                     "$filter": {
-    //                         "input": "$active_alarms",
-    //                         "as": "alarm",
-    //                         "cond": { "$eq": [ "$$alarm.time", start_time ] }
-    //                     }
-    //                 }
-    //             ]
-    //         }
-    //     }
-    // };
-    // match collection.update_one(filter, update).await {
-    //     Ok(update_result) => {
-    //         if update_result.matched_count > 0 {
-    //             info!("Alarm cleared moved to history for resident. Matched: {} Updated: {}", update_result.matched_count, update_result.modified_count);
-    //         } else {
-    //             warn!("No resident found to clear alarm.");
-    //         }
-    //     }
-    //     Err(e) => {
-    //         error!("Failed to clear alarm: {}", e);
-    //     }
-    // }
     Ok(())
 }
 
