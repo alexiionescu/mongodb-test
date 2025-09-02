@@ -82,6 +82,30 @@ pub mod serde_helpers {
     }
 }
 
+/// print query cursor to tty nice table view
+pub async fn bson_table_print(cursor: mongodb::Cursor<bson::Document>) -> Result<()> {
+    let mut table = comfy_table::Table::new();
+    let mut first = true;
+    let mut cursor = cursor;
+    while let Some(doc) = cursor.try_next().await? {
+        if first {
+            // Write the header row (keys of the BSON document)
+            let headers: Vec<&str> = doc.keys().map(|k| k.as_str()).collect();
+            table.set_header(headers);
+            first = false;
+        }
+        // Write the values row (values of the BSON document)
+        let values: Vec<String> = doc
+            .values()
+            .enumerate()
+            .map(|(i, v)| bson_value_to_str(v, doc.keys().nth(i).unwrap()))
+            .collect();
+        table.add_row(values);
+    }
+    println!("{table}");
+    Ok(())
+}
+
 /// Converts a BSON Documents Cursor to a CSV file
 pub async fn bson_to_csv(
     mut cursor: mongodb::Cursor<bson::Document>,
@@ -99,7 +123,11 @@ pub async fn bson_to_csv(
             first = false;
         }
         // Write the values row (values of the BSON document)
-        let values: Vec<String> = doc.values().map(bson_value_to_str).collect();
+        let values: Vec<String> = doc
+            .values()
+            .enumerate()
+            .map(|(i, v)| bson_value_to_str(v, doc.keys().nth(i).unwrap()))
+            .collect();
         writer.write_record(&values)?;
     }
 
@@ -108,7 +136,21 @@ pub async fn bson_to_csv(
     Ok(())
 }
 
-fn bson_value_to_str(value: &bson::Bson) -> String {
+pub fn format_timedelta(duration: &f64) -> String {
+    let total_minutes = (duration / 60.0).round() as i64;
+    let days = total_minutes / 1440;
+    let hours = (total_minutes % 1440) / 60;
+    let minutes = total_minutes % 60;
+    if days > 0 {
+        format!("{days:02} days {hours:02}h {minutes:02}m")
+    } else if hours > 0 {
+        format!("{hours:02}h {minutes:02}m")
+    } else {
+        format!("{:4}{minutes:02}m", "")
+    }
+}
+
+fn bson_value_to_str(value: &bson::Bson, key: &str) -> String {
     match value {
         bson::Bson::String(s) => s.clone(),
         bson::Bson::Boolean(b) => {
@@ -118,17 +160,27 @@ fn bson_value_to_str(value: &bson::Bson) -> String {
                 "no".into()
             }
         }
-        bson::Bson::DateTime(dt) => bson_to_chrono(dt)
-            .map(|cdt| {
-                cdt.with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "Invalid Date".into()),
+        bson::Bson::ObjectId(oid) => oid.to_string(),
+        bson::Bson::DateTime(dt) => dt
+            .to_chrono()
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        bson::Bson::Double(d) => {
+            println!("Formatting BSON Double: {} for {}", d, key);
+            if key.contains("duration") {
+                format_timedelta(d)
+            } else {
+                format!("{:.2}", d)
+            }
+        }
+        bson::Bson::Int64(i) => {
+            if key.contains("duration") {
+                format_timedelta(&(*i as f64))
+            } else {
+                i.to_string()
+            }
+        }
         _ => value.to_string(),
     }
-}
-
-fn bson_to_chrono(dt: &bson::DateTime) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::from_timestamp_millis(dt.timestamp_millis())
 }

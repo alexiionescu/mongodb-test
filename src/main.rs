@@ -30,6 +30,13 @@ enum CliCommand {
         count: usize,
         #[clap(long)]
         no_clear: bool,
+        #[clap(
+            short,
+            long,
+            default_value_t = 600,
+            help = "Maximum duration in seconds"
+        )]
+        duration: u64,
     },
     InsertCsv {
         file_path: String,
@@ -240,6 +247,7 @@ async fn main() -> Result<()> {
             file_path,
             count,
             no_clear,
+            duration,
         } => {
             let mut reader = ReaderBuilder::new()
                 .has_headers(true)
@@ -267,7 +275,7 @@ async fn main() -> Result<()> {
                         &name,
                         &birth,
                         DateTimeStr::DateTime(alarm_time),
-                        Some(rand::random::<u64>() % 600),
+                        Some(rand::random::<u64>() % *duration),
                     )
                     .await?;
                 }
@@ -348,21 +356,20 @@ async fn test_query(
         doc! { "$project": {
             "name": 1, "location": 1,
             "alarms_count": { "$size": { "$ifNull": ["$filteredAlarms", []] } },
-            "alarms_avg_duration": { "$avg": "$filteredAlarms.duration_sec" },
-            "alarms_min_time": { "$min": "$filteredAlarms.time" },
-            "alarms_max_time": { "$max": "$filteredAlarms.time" },
-            "active_alarms_count": { "$size": { "$ifNull": ["$active_alarms", []] } }
+            "avg_duration": { "$avg": "$filteredAlarms.duration_sec" },
+            "max_duration": { "$max": "$filteredAlarms.duration_sec" },
+            "first": { "$min": "$filteredAlarms.time" },
+            "last": { "$max": "$filteredAlarms.time" },
+            "active": { "$size": { "$ifNull": ["$active_alarms", []] } }
         } },
         doc! { "$sort": { "location": 1 } },
     ];
     match collection.aggregate(pipeline).await {
-        Ok(mut cursor) => {
+        Ok(cursor) => {
             if let Some(csv) = csv {
                 utils::bson_to_csv(cursor, csv).await?;
             } else {
-                while let Some(resident) = cursor.try_next().await? {
-                    println!("{}", resident);
-                }
+                utils::bson_table_print(cursor).await?;
             }
         }
         Err(e) => {
