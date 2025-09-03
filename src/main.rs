@@ -386,30 +386,35 @@ async fn test_query(
     });
     let pipeline = vec![
         doc! { "$addFields": {
-            "filteredAlarms": {
-                "$slice": [
-                    {
-                        "$filter": {
-                            "input": "$alarms",
-                            "as": "alarm",
-                            "cond": {
-                                "$and": [
-                                    if let Some(from_date) = &query_params.from_date {
-                                        doc! { "$gte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")? ] }
-                                    } else {
-                                        doc! { }
-                                    },
-                                    if let Some(to_date) = &query_params.to_date {
-                                        doc! { "$lte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")? ] }
-                                    } else {
-                                        doc! { }
-                                    }
-                                ]
+            "filteredAlarms":
+            if query_params.from_date.is_some() || query_params.to_date.is_some() {
+                doc! {
+                    "$slice": [
+                        {
+                            "$filter": {
+                                "input": "$alarms",
+                                "as": "alarm",
+                                "cond": {
+                                    "$and": [
+                                        if let Some(from_date) = &query_params.from_date {
+                                            doc! { "$gte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(from_date.to_string() + "T00:00:00Z")? ] }
+                                        } else {
+                                            doc! { }
+                                        },
+                                        if let Some(to_date) = &query_params.to_date {
+                                            doc! { "$lte": [ "$$alarm.time", bson::DateTime::parse_rfc3339_str(to_date.to_string() + "T23:59:59.999Z")? ] }
+                                        } else {
+                                            doc! { }
+                                        }
+                                    ]
+                                }
                             }
-                        }
-                    },
-                    -query_params.alarms_limit
-                ]
+                        },
+                        -query_params.alarms_limit
+                    ]
+                }
+            } else {
+                doc! { "$slice": [ "$alarms", -query_params.alarms_limit ] }
             }
         } },
         doc! { "$match": filter },
@@ -425,6 +430,10 @@ async fn test_query(
         } },
         doc! { "$sort": { "location": 1 } },
     ];
+    tracing::trace!(
+        "Aggregation pipeline: {}",
+        serde_json::to_string(&pipeline).unwrap_or_default()
+    );
     let time = Instant::now();
     match collection.aggregate(pipeline).await {
         Ok(cursor) => {
