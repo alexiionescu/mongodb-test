@@ -11,7 +11,7 @@ use mongodb::{
     options::{ClientOptions, IndexOptions, ServerApi, ServerApiVersion},
 };
 use tokio::time::Instant;
-use tracing::{Level, error, info, warn};
+use tracing::{Level, debug, error, info, warn};
 use utils::DateTimeStr;
 
 #[derive(Parser)]
@@ -273,6 +273,7 @@ async fn main() -> Result<()> {
                 .has_headers(true)
                 .from_path(file_path)?;
             let mut alarms = Vec::new();
+            let mut exec_duration = 0;
             while *count > 0
                 && let Some(Ok(record)) = reader.deserialize::<ResidentCsv>().next()
             {
@@ -284,6 +285,7 @@ async fn main() -> Result<()> {
                 let start_time = bson::DateTime::now().saturating_add_duration(
                     Duration::from_secs(rand::random::<u64>() % (3 * *duration)),
                 );
+                let time = Instant::now();
                 alarms.push((
                     name,
                     birth.clone(),
@@ -296,10 +298,20 @@ async fn main() -> Result<()> {
                     )
                     .await?,
                 ));
+                exec_duration += time.elapsed().as_millis() as u64;
                 *count -= 1;
             }
+            let alarms_len = alarms.len();
+            info!(
+                "Generated {} alarms in {} ms (avg: {} ms)",
+                alarms_len,
+                exec_duration,
+                exec_duration / alarms_len as u64
+            );
             if !*no_clear {
+                exec_duration = 0;
                 for (name, birth, alarm_time) in alarms {
+                    let time = Instant::now();
                     test_clear_alarm(
                         &collection,
                         &name,
@@ -308,7 +320,14 @@ async fn main() -> Result<()> {
                         Some(rand::random::<u64>() % *duration),
                     )
                     .await?;
+                    exec_duration += time.elapsed().as_millis() as u64;
                 }
+                info!(
+                    "Cleared {} alarms in {} ms (avg: {} ms)",
+                    alarms_len,
+                    exec_duration,
+                    exec_duration / alarms_len as u64
+                );
             }
         }
         CliCommand::ForceClose { name, birth } => {
@@ -486,16 +505,8 @@ async fn test_new_alarm(
         Ok(update_result) => {
             if update_result.matched_count > 0 {
                 info!(
-                    "Alarm {} added to resident. Matched: {} Updated: {}",
+                    "New Alarm\t'{name}' '{birth}' '{}'",
                     new_alarm.time.try_to_rfc3339_string()?,
-                    update_result.matched_count,
-                    update_result.modified_count
-                );
-                println!(
-                    "To clear: mongodb-test clear-alarm '{}' '{}' '{}'",
-                    name,
-                    birth,
-                    new_alarm.time.try_to_rfc3339_string()?
                 );
                 Ok(new_alarm.time)
             } else {
@@ -564,7 +575,7 @@ async fn test_clear_alarm(
         match collection.update_one(filter.clone(), update).await {
             Ok(update_result) => {
                 if update_result.matched_count > 0 {
-                    info!(
+                    debug!(
                         "Alarm cleared from active for resident. Matched: {} Updated: {}",
                         update_result.matched_count, update_result.modified_count
                     );
@@ -590,7 +601,7 @@ async fn test_clear_alarm(
         match collection.update_one(filter, history_update).await {
             Ok(update_result) => {
                 if update_result.matched_count > 0 {
-                    info!(
+                    debug!(
                         "Alarm added to history for resident. Matched: {} Updated: {}",
                         update_result.matched_count, update_result.modified_count
                     );
