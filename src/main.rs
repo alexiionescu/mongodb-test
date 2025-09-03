@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, arg, command};
@@ -248,7 +248,7 @@ async fn main() -> Result<()> {
             birth,
             message,
         } => {
-            test_new_alarm(&collection, name, birth, message).await?;
+            test_new_alarm(&collection, name, birth, message, None).await?;
         }
         CliCommand::ClearAlarm {
             name,
@@ -281,10 +281,20 @@ async fn main() -> Result<()> {
                 }
                 let name = record.name.clone();
                 let birth = record.birth.try_to_rfc3339_string()?[..10].to_string();
+                let start_time = bson::DateTime::now().saturating_add_duration(
+                    Duration::from_secs(rand::random::<u64>() % (3 * *duration)),
+                );
                 alarms.push((
                     name,
                     birth.clone(),
-                    test_new_alarm(&collection, &record.name, &birth, "test csv alarm").await?,
+                    test_new_alarm(
+                        &collection,
+                        &record.name,
+                        &birth,
+                        "test csv alarm",
+                        Some(start_time),
+                    )
+                    .await?,
                 ));
                 *count -= 1;
             }
@@ -458,6 +468,7 @@ async fn test_new_alarm(
     name: &str,
     birth: &str,
     message: &str,
+    start_time: Option<bson::DateTime>,
 ) -> Result<bson::DateTime> {
     let birth_date: bson::DateTime = DateTimeStr::Str(birth).into();
     let filter = doc! {
@@ -465,7 +476,7 @@ async fn test_new_alarm(
         "birth": birth_date,
     };
     let new_alarm = ActiveAlarm {
-        time: bson::DateTime::now(),
+        time: start_time.unwrap_or_else(bson::DateTime::now),
         message: message.to_string(),
     };
     let update = doc! {
