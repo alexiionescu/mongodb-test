@@ -60,6 +60,8 @@ enum CliCommand {
             help = "Maximum duration in seconds"
         )]
         duration: u64,
+        #[clap(long, help = "Dry Run - do not insert or clear alarms")]
+        dry_run: bool,
     },
     InsertCsv {
         file_path: String,
@@ -268,16 +270,45 @@ async fn main() -> Result<()> {
             count,
             no_clear,
             duration,
+            dry_run,
         } => {
             let mut reader = ReaderBuilder::new()
                 .has_headers(true)
                 .from_path(file_path)?;
             let mut alarms = Vec::new();
             let mut exec_duration = 0;
+            let mut prob = 0.02 + rand::random::<f32>() * 0.18; // initial probability between 2% and 20%
+            info!(
+                "Starting alarm generation for {} alarms with initial prob: {:.2}%",
+                *count,
+                prob * 100.0
+            );
+            let half_count = *count as f32 / 2.0;
+            let mut record_no = 0;
             while *count > 0
                 && let Some(Ok(record)) = reader.deserialize::<ResidentCsv>().next()
             {
-                if rand::random::<f32>() > (0.02 + *count as f32 * 0.02) {
+                record_no += 1;
+                if rand::random::<f32>() > prob {
+                    // tracing::trace!(
+                    //     "[{}] Skipping record, current prob: {:.2}%",
+                    //     record_no,
+                    //     prob * 100.0
+                    // );
+                    prob += 0.00005 * (*count as f32 - half_count);
+                    if prob < 0.02 {
+                        prob = 0.02;
+                    }
+                    continue;
+                }
+                if *dry_run {
+                    info!(
+                        "[{}] Dry Run - would add alarm for prob: {:.2}%. Remaining: {}",
+                        record_no,
+                        prob * 100.0,
+                        *count
+                    );
+                    *count -= 1;
                     continue;
                 }
                 let name = record.name.clone();
@@ -302,8 +333,15 @@ async fn main() -> Result<()> {
                 *count -= 1;
             }
             let alarms_len = alarms.len();
+            if alarms_len == 0 {
+                info!(
+                    "Dry Run - no alarms were added. Final prob: {:.2}%",
+                    prob * 100.0
+                );
+                return Ok(());
+            }
             info!(
-                "Generated {} alarms in {} ms (avg: {} ms)",
+                "Generated {} alarms in {} ms (avg: {} ms).",
                 alarms_len,
                 exec_duration,
                 exec_duration / alarms_len as u64
@@ -421,7 +459,7 @@ async fn test_query(
                     "$slice": [
                         {
                             "$filter": {
-                                "input": "$alarms",
+                                "input": { "$ifNull": ["$alarms", []] },
                                 "as": "alarm",
                                 "cond": {
                                     "$and": [
@@ -443,7 +481,7 @@ async fn test_query(
                     ]
                 }
             } else {
-                doc! { "$slice": [ "$alarms", -query_params.alarms_limit ] }
+                doc! { "$slice": [ { "$ifNull": ["$alarms", []] }, -query_params.alarms_limit ] }
             }
         } },
         doc! { "$match": filter },
