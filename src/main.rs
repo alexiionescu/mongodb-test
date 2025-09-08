@@ -92,6 +92,7 @@ enum CliCommand {
     },
     Query(QueryParams),
     SimpleTest,
+    Stats,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -370,6 +371,20 @@ async fn main() -> Result<()> {
         }
         CliCommand::ForceClose { name, birth } => {
             test_force_close(&collection, name, birth).await?;
+        }
+        CliCommand::Stats => {
+            let pipeline = vec![doc! {
+                "$collStats": {
+                    "latencyStats": { "histograms": true },
+                    "storageStats": { "scale": 1024 },
+                    "count" : {},
+                    "queryExecStats" : {}
+                }
+            }];
+            let mut stats = collection.aggregate(pipeline).await?;
+            while let Some(stat) = stats.try_next().await? {
+                println!("{}", serde_json::to_string_pretty(&stat)?);
+            }
         }
     }
 
