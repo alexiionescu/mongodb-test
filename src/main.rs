@@ -10,6 +10,7 @@ use mongodb::{
     error::{WriteError, WriteFailure},
     options::{ClientOptions, IndexOptions, ServerApi, ServerApiVersion},
 };
+use rand::seq::IteratorRandom as _;
 use tokio::time::Instant;
 use tracing::{Level, debug, error, info, warn};
 use utils::DateTimeStr;
@@ -46,23 +47,26 @@ struct QueryParams {
     #[clap(long, help = "CSV File to Save Results")]
     csv: Option<String>,
 }
+
+#[derive(Parser)]
+struct CsvBulkAlarmOptions {
+    file_path: String,
+    count: usize,
+    #[clap(long)]
+    no_clear: bool,
+    #[clap(
+        short,
+        long,
+        default_value_t = 600,
+        help = "Maximum duration in seconds"
+    )]
+    duration: u64,
+    #[clap(long, help = "Dry Run - do not insert or clear alarms")]
+    dry_run: bool,
+}
 #[derive(Subcommand)]
 enum CliCommand {
-    NewAlarmCsv {
-        file_path: String,
-        count: usize,
-        #[clap(long)]
-        no_clear: bool,
-        #[clap(
-            short,
-            long,
-            default_value_t = 600,
-            help = "Maximum duration in seconds"
-        )]
-        duration: u64,
-        #[clap(long, help = "Dry Run - do not insert or clear alarms")]
-        dry_run: bool,
-    },
+    NewAlarmCsv(CsvBulkAlarmOptions),
     InsertCsv {
         file_path: String,
     },
@@ -89,6 +93,9 @@ enum CliCommand {
     ForceClose {
         name: String,
         birth: String,
+    },
+    ForceCloseCsv {
+        file_path: String,
     },
     Query(QueryParams),
     SimpleTest,
@@ -174,7 +181,7 @@ impl fmt::Display for Resident {
     }
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 struct ResidentCsv {
     name: String,
     #[serde(with = "utils::serde_helpers::bson_dateonly")]
@@ -266,111 +273,14 @@ async fn main() -> Result<()> {
         CliCommand::InsertCsv { file_path } => {
             test_insert_csv(&collection, file_path, cli.upsert).await?;
         }
-        CliCommand::NewAlarmCsv {
-            file_path,
-            count,
-            no_clear,
-            duration,
-            dry_run,
-        } => {
-            let mut reader = ReaderBuilder::new()
-                .has_headers(true)
-                .from_path(file_path)?;
-            let mut alarms = Vec::new();
-            let mut exec_duration = 0;
-            let mut prob = 0.02 + rand::random::<f32>() * 0.18; // initial probability between 2% and 20%
-            info!(
-                "Starting alarm generation for {} alarms with initial prob: {:.2}%",
-                *count,
-                prob * 100.0
-            );
-            let half_count = *count as f32 / 2.0;
-            let mut record_no = 0;
-            while *count > 0
-                && let Some(Ok(record)) = reader.deserialize::<ResidentCsv>().next()
-            {
-                record_no += 1;
-                if rand::random::<f32>() > prob {
-                    // tracing::trace!(
-                    //     "[{}] Skipping record, current prob: {:.2}%",
-                    //     record_no,
-                    //     prob * 100.0
-                    // );
-                    prob += 0.00005 * (*count as f32 - half_count);
-                    if prob < 0.02 {
-                        prob = 0.02;
-                    }
-                    continue;
-                }
-                if *dry_run {
-                    info!(
-                        "[{}] Dry Run - would add alarm for prob: {:.2}%. Remaining: {}",
-                        record_no,
-                        prob * 100.0,
-                        *count
-                    );
-                    *count -= 1;
-                    continue;
-                }
-                let name = record.name.clone();
-                let birth = record.birth.try_to_rfc3339_string()?[..10].to_string();
-                let start_time = bson::DateTime::now().saturating_add_duration(
-                    Duration::from_secs(rand::random::<u64>() % (3 * *duration)),
-                );
-                let time = Instant::now();
-                alarms.push((
-                    name,
-                    birth.clone(),
-                    test_new_alarm(
-                        &collection,
-                        &record.name,
-                        &birth,
-                        "test csv alarm",
-                        Some(start_time),
-                    )
-                    .await?,
-                ));
-                exec_duration += time.elapsed().as_millis() as u64;
-                *count -= 1;
-            }
-            let alarms_len = alarms.len();
-            if alarms_len == 0 {
-                info!(
-                    "Dry Run - no alarms were added. Final prob: {:.2}%",
-                    prob * 100.0
-                );
-                return Ok(());
-            }
-            info!(
-                "Generated {} alarms in {} ms (avg: {} ms).",
-                alarms_len,
-                exec_duration,
-                exec_duration / alarms_len as u64
-            );
-            if !*no_clear {
-                exec_duration = 0;
-                for (name, birth, alarm_time) in alarms {
-                    let time = Instant::now();
-                    test_clear_alarm(
-                        &collection,
-                        &name,
-                        &birth,
-                        DateTimeStr::DateTime(alarm_time),
-                        Some(rand::random::<u64>() % *duration),
-                    )
-                    .await?;
-                    exec_duration += time.elapsed().as_millis() as u64;
-                }
-                info!(
-                    "Cleared {} alarms in {} ms (avg: {} ms)",
-                    alarms_len,
-                    exec_duration,
-                    exec_duration / alarms_len as u64
-                );
-            }
+        CliCommand::NewAlarmCsv(options) => {
+            test_bulk_alarms(&collection, options).await?;
         }
         CliCommand::ForceClose { name, birth } => {
             test_force_close(&collection, name, birth).await?;
+        }
+        CliCommand::ForceCloseCsv { file_path } => {
+            test_force_close_csv(&collection, file_path).await?;
         }
         CliCommand::Stats => {
             let pipeline = vec![doc! {
@@ -388,6 +298,118 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn test_force_close_csv(collection: &Collection<Resident>, file_path: &str) -> Result<()> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(file_path)?;
+    for result in reader.deserialize::<ResidentCsv>() {
+        let record = result?;
+        let birth = record.birth.try_to_rfc3339_string()?[..10].to_string();
+        test_force_close(collection, &record.name, &birth).await?;
+    }
+    Ok(())
+}
+
+async fn test_bulk_alarms(
+    collection: &Collection<Resident>,
+    options: &mut CsvBulkAlarmOptions,
+) -> Result<()> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(&options.file_path)?;
+    let mut alarms = Vec::new();
+    let mut exec_duration = 0;
+    let mut record_no = 0;
+    let residents = reader
+        .deserialize::<ResidentCsv>()
+        .filter_map(|res| res.ok())
+        .collect::<Vec<_>>();
+    let mut rng = rand::rng();
+    let shuffle_size = options.count.min(10 + residents.len() / 10);
+    let mut shuffled_residents = residents
+        .as_slice()
+        .iter()
+        .choose_multiple(&mut rng, shuffle_size)
+        .into_iter();
+    while options.count > 0 {
+        record_no += 1;
+        let record = if let Some(rec) = shuffled_residents.next() {
+            rec
+        } else {
+            shuffled_residents = residents
+                .as_slice()
+                .iter()
+                .choose_multiple(&mut rng, shuffle_size)
+                .into_iter();
+            shuffled_residents.next().unwrap()
+        };
+        if options.dry_run {
+            info!(
+                "[{}] Dry Run - '{}' Alarm. Remaining: {}",
+                record_no, record.location, options.count
+            );
+            options.count -= 1;
+            continue;
+        }
+        let name = record.name.clone();
+        let birth = record.birth.try_to_rfc3339_string()?[..10].to_string();
+        let start_time = bson::DateTime::now().saturating_add_duration(Duration::from_secs(
+            rand::random::<u64>() % (3 * options.duration),
+        ));
+        let time = Instant::now();
+
+        match test_new_alarm(
+            collection,
+            &record.name,
+            &birth,
+            "test csv alarm",
+            Some(start_time),
+        )
+        .await
+        {
+            Ok(alarm) => {
+                alarms.push((name, birth.clone(), alarm));
+                exec_duration += time.elapsed().as_millis() as u64;
+                options.count -= 1;
+            }
+            Err(err) => error!("Failed to create alarm: {} for {}", err, record.location),
+        };
+    }
+    let alarms_len = alarms.len();
+    if alarms_len == 0 {
+        info!("Dry Run - no alarms were added.");
+        return Ok(());
+    }
+    info!(
+        "Generated {} alarms in {} ms (avg: {} ms).",
+        alarms_len,
+        exec_duration,
+        exec_duration / alarms_len as u64
+    );
+    if !options.no_clear {
+        exec_duration = 0;
+        for (name, birth, alarm_time) in alarms {
+            let time = Instant::now();
+            test_clear_alarm(
+                collection,
+                &name,
+                &birth,
+                DateTimeStr::DateTime(alarm_time),
+                Some(rand::random::<u64>() % options.duration),
+            )
+            .await?;
+            exec_duration += time.elapsed().as_millis() as u64;
+        }
+        info!(
+            "Cleared {} alarms in {} ms (avg: {} ms)",
+            alarms_len,
+            exec_duration,
+            exec_duration / alarms_len as u64
+        );
+    }
     Ok(())
 }
 
@@ -429,6 +451,10 @@ async fn test_insert_csv(
         .from_path(file_path)?;
     for result in reader.deserialize::<ResidentCsv>() {
         let record: Resident = result?.into();
+        if record.name.is_empty() || record.location.is_empty() {
+            warn!("Skipping record with empty name or location: {}", record);
+            continue;
+        }
         println!("Importing {}", record);
         if upsert {
             test_upsert(collection, record).await?;
